@@ -10,7 +10,7 @@ categories = ["authentication", "web-programming::http-client"]
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false }
-cross-krb5 = "0.4"
+cross-krb5 = { version = "0.4", default-features = false }
 base64 = "0.22"
 thiserror = "2"
 
