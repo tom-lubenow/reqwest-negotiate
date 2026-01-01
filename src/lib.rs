@@ -80,9 +80,9 @@ use reqwest::{RequestBuilder, Response};
 
 /// Extracts the service principal name from a URL host.
 ///
-/// Returns the SPN in the format `HTTP@<hostname>`.
+/// Returns the SPN in the format `HTTP/<hostname>`.
 fn spn_from_host(host: &str) -> String {
-    format!("HTTP@{}", host)
+    format!("HTTP/{}", host)
 }
 
 /// Parses a Negotiate token from a WWW-Authenticate header value.
@@ -390,25 +390,25 @@ mod tests {
 
         #[test]
         fn simple_hostname() {
-            assert_eq!(spn_from_host("api.example.com"), "HTTP@api.example.com");
+            assert_eq!(spn_from_host("api.example.com"), "HTTP/api.example.com");
         }
 
         #[test]
         fn hostname_with_subdomain() {
             assert_eq!(
                 spn_from_host("service.internal.example.com"),
-                "HTTP@service.internal.example.com"
+                "HTTP/service.internal.example.com"
             );
         }
 
         #[test]
         fn localhost() {
-            assert_eq!(spn_from_host("localhost"), "HTTP@localhost");
+            assert_eq!(spn_from_host("localhost"), "HTTP/localhost");
         }
 
         #[test]
         fn ip_address() {
-            assert_eq!(spn_from_host("192.168.1.1"), "HTTP@192.168.1.1");
+            assert_eq!(spn_from_host("192.168.1.1"), "HTTP/192.168.1.1");
         }
     }
 
