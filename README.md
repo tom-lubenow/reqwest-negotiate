@@ -49,7 +49,7 @@ kinit user@REALM.COM
 ```toml
 [dependencies]
 reqwest-negotiate = "0.1"
-reqwest = "0.12"
+reqwest = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

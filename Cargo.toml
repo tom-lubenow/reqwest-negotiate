@@ -9,11 +9,11 @@ keywords = ["kerberos", "spnego", "negotiate", "reqwest", "authentication"]
 categories = ["authentication", "web-programming::http-client"]
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false }
-libgssapi = "0.7"
+reqwest = { version = "0.13", default-features = false }
+libgssapi = "0.9"
 base64 = "0.22"
 thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-reqwest = { version = "0.12", features = ["default-tls"] }
+reqwest = { version = "0.13", features = ["default-tls"] }
