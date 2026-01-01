@@ -74,10 +74,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use libgssapi::context::{ClientCtx, CtxFlags, SecurityContext};
-use libgssapi::credential::{Cred, CredUsage};
-use libgssapi::name::Name;
-use libgssapi::oid::{GSS_MECH_KRB5, GSS_NT_HOSTBASED_SERVICE, OidSet};
+use cross_krb5::{ClientCtx, InitiateFlags, PendingClientCtx, Step};
 use reqwest::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response};
 
@@ -141,12 +138,18 @@ pub enum NegotiateError {
     InvalidTokenFormat,
 }
 
+/// Internal state for the context - either pending or complete.
+enum ContextState {
+    Pending(PendingClientCtx),
+    Complete(ClientCtx),
+}
+
 /// Holds the GSSAPI context for mutual authentication verification.
 ///
 /// After sending a request with [`NegotiateAuthExt::negotiate_auth_mutual`],
 /// use this context to verify the server's response token.
 pub struct NegotiateContext {
-    ctx: ClientCtx,
+    state: Option<ContextState>,
 }
 
 impl NegotiateContext {
@@ -191,10 +194,28 @@ impl NegotiateContext {
 
         let token = parse_negotiate_header(header_str)?;
 
-        // Verify the server's token
-        match self.ctx.step(Some(&token), None) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(NegotiateError::MutualAuthFailed(e.to_string())),
+        // Take ownership of the state to step it
+        let current_state = self.state.take().ok_or(NegotiateError::ContextError(
+            "context already consumed".into(),
+        ))?;
+
+        match current_state {
+            ContextState::Pending(pending) => match pending.step(&token) {
+                Ok(Step::Continue((new_pending, _))) => {
+                    self.state = Some(ContextState::Pending(new_pending));
+                    Ok(())
+                }
+                Ok(Step::Finished((ctx, _))) => {
+                    self.state = Some(ContextState::Complete(ctx));
+                    Ok(())
+                }
+                Err(e) => Err(NegotiateError::MutualAuthFailed(e.to_string())),
+            },
+            ContextState::Complete(ctx) => {
+                // Already complete, restore state
+                self.state = Some(ContextState::Complete(ctx));
+                Ok(())
+            }
         }
     }
 
@@ -202,7 +223,7 @@ impl NegotiateContext {
     ///
     /// Returns `true` if mutual authentication is complete.
     pub fn is_complete(&self) -> bool {
-        self.ctx.is_complete()
+        matches!(self.state, Some(ContextState::Complete(_)))
     }
 }
 
@@ -342,39 +363,22 @@ fn add_negotiate_header_with_ctx(
             .map_err(|e| NegotiateError::ContextError(e.to_string()))?,
     );
 
-    Ok((builder, NegotiateContext { ctx }))
+    Ok((builder, ctx))
 }
 
-fn generate_negotiate_token_with_ctx(spn: &str) -> Result<(Vec<u8>, ClientCtx), NegotiateError> {
-    // Create the service principal name
-    let name = Name::new(spn.as_bytes(), Some(&GSS_NT_HOSTBASED_SERVICE))
-        .map_err(|e| NegotiateError::NameError(e.to_string()))?;
+fn generate_negotiate_token_with_ctx(
+    spn: &str,
+) -> Result<(Vec<u8>, NegotiateContext), NegotiateError> {
+    // Initialize the client context - cross-krb5 handles credential acquisition
+    // ClientCtx::new returns (PendingClientCtx, initial_token)
+    let (pending_ctx, token) = ClientCtx::new(InitiateFlags::empty(), None, spn, None)
+        .map_err(|e| NegotiateError::ContextError(e.to_string()))?;
 
-    // Acquire default credentials for the current user
-    let mut mechs = OidSet::new().map_err(|e| NegotiateError::CredentialError(e.to_string()))?;
-    mechs
-        .add(&GSS_MECH_KRB5)
-        .map_err(|e| NegotiateError::CredentialError(e.to_string()))?;
+    let ctx = NegotiateContext {
+        state: Some(ContextState::Pending(pending_ctx)),
+    };
 
-    let cred = Cred::acquire(None, None, CredUsage::Initiate, Some(&mechs))
-        .map_err(|e| NegotiateError::CredentialError(e.to_string()))?;
-
-    // Initialize the client context with mutual auth flag
-    let mut ctx = ClientCtx::new(
-        Some(cred),
-        name,
-        CtxFlags::GSS_C_MUTUAL_FLAG | CtxFlags::GSS_C_SEQUENCE_FLAG,
-        Some(&GSS_MECH_KRB5),
-    );
-
-    // Generate the initial token
-    match ctx.step(None, None) {
-        Ok(Some(token)) => Ok((token.to_vec(), ctx)),
-        Ok(None) => Err(NegotiateError::ContextError(
-            "no token generated".to_string(),
-        )),
-        Err(e) => Err(NegotiateError::ContextError(e.to_string())),
-    }
+    Ok((token.to_vec(), ctx))
 }
 
 #[cfg(test)]
