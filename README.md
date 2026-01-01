@@ -4,10 +4,6 @@ Kerberos/SPNEGO Negotiate authentication for [reqwest](https://crates.io/crates/
 
 This crate provides an extension trait for `reqwest::RequestBuilder` that adds HTTP Negotiate (SPNEGO/Kerberos) authentication, similar to `curl --negotiate`.
 
-## Status
-
-**Experimental** - This crate is functional but has limited real-world testing. API may change in future versions.
-
 ## Platform Support
 
 | Platform | Status |
