@@ -72,14 +72,38 @@
 //! # }
 //! ```
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use libgssapi::context::{ClientCtx, CtxFlags, SecurityContext};
 use libgssapi::credential::{Cred, CredUsage};
 use libgssapi::name::Name;
 use libgssapi::oid::{GSS_MECH_KRB5, GSS_NT_HOSTBASED_SERVICE, OidSet};
-use reqwest::header::{HeaderValue, AUTHORIZATION, WWW_AUTHENTICATE};
+use reqwest::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response};
+
+/// Extracts the service principal name from a URL host.
+///
+/// Returns the SPN in the format `HTTP@<hostname>`.
+fn spn_from_host(host: &str) -> String {
+    format!("HTTP@{}", host)
+}
+
+/// Parses a Negotiate token from a WWW-Authenticate header value.
+///
+/// Returns the decoded token bytes, or an error if the header is malformed.
+fn parse_negotiate_header(header_value: &str) -> Result<Vec<u8>, NegotiateError> {
+    let token_b64 = header_value
+        .strip_prefix("Negotiate ")
+        .ok_or(NegotiateError::InvalidTokenFormat)?;
+
+    if token_b64.is_empty() {
+        return Err(NegotiateError::MissingMutualAuthToken);
+    }
+
+    BASE64
+        .decode(token_b64)
+        .map_err(|_| NegotiateError::InvalidTokenFormat)
+}
 
 /// Errors that can occur during Negotiate authentication.
 #[derive(Debug, thiserror::Error)]
@@ -165,17 +189,7 @@ impl NegotiateContext {
             .to_str()
             .map_err(|_| NegotiateError::InvalidTokenFormat)?;
 
-        let token_b64 = header_str
-            .strip_prefix("Negotiate ")
-            .ok_or(NegotiateError::InvalidTokenFormat)?;
-
-        if token_b64.is_empty() {
-            return Err(NegotiateError::MissingMutualAuthToken);
-        }
-
-        let token = BASE64
-            .decode(token_b64)
-            .map_err(|_| NegotiateError::InvalidTokenFormat)?;
+        let token = parse_negotiate_header(header_str)?;
 
         // Verify the server's token
         match self.ctx.step(Some(&token), None) {
@@ -302,7 +316,7 @@ impl NegotiateAuthExt for RequestBuilder {
             .url()
             .host_str()
             .ok_or(NegotiateError::MissingHost)?;
-        let spn = format!("HTTP@{}", host);
+        let spn = spn_from_host(host);
 
         add_negotiate_header_with_ctx(self, &spn)
     }
@@ -331,9 +345,7 @@ fn add_negotiate_header_with_ctx(
     Ok((builder, NegotiateContext { ctx }))
 }
 
-fn generate_negotiate_token_with_ctx(
-    spn: &str,
-) -> Result<(Vec<u8>, ClientCtx), NegotiateError> {
+fn generate_negotiate_token_with_ctx(spn: &str) -> Result<(Vec<u8>, ClientCtx), NegotiateError> {
     // Create the service principal name
     let name = Name::new(spn.as_bytes(), Some(&GSS_NT_HOSTBASED_SERVICE))
         .map_err(|e| NegotiateError::NameError(e.to_string()))?;
@@ -369,11 +381,156 @@ fn generate_negotiate_token_with_ctx(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_spn_format() {
-        // Just a basic sanity check that the SPN format is correct
-        let host = "api.example.com";
-        let spn = format!("HTTP@{}", host);
-        assert_eq!(spn, "HTTP@api.example.com");
+    mod spn_derivation {
+        use super::*;
+
+        #[test]
+        fn simple_hostname() {
+            assert_eq!(spn_from_host("api.example.com"), "HTTP@api.example.com");
+        }
+
+        #[test]
+        fn hostname_with_subdomain() {
+            assert_eq!(
+                spn_from_host("service.internal.example.com"),
+                "HTTP@service.internal.example.com"
+            );
+        }
+
+        #[test]
+        fn localhost() {
+            assert_eq!(spn_from_host("localhost"), "HTTP@localhost");
+        }
+
+        #[test]
+        fn ip_address() {
+            assert_eq!(spn_from_host("192.168.1.1"), "HTTP@192.168.1.1");
+        }
+    }
+
+    mod negotiate_header_parsing {
+        use super::*;
+
+        #[test]
+        fn valid_token() {
+            // "hello world" base64 encoded
+            let header = "Negotiate aGVsbG8gd29ybGQ=";
+            let result = parse_negotiate_header(header).unwrap();
+            assert_eq!(result, b"hello world");
+        }
+
+        #[test]
+        fn valid_empty_looking_but_valid_base64() {
+            // Single byte base64 encoded
+            let header = "Negotiate QQ==";
+            let result = parse_negotiate_header(header).unwrap();
+            assert_eq!(result, b"A");
+        }
+
+        #[test]
+        fn missing_negotiate_prefix() {
+            let header = "Basic dXNlcjpwYXNz";
+            let result = parse_negotiate_header(header);
+            assert!(matches!(result, Err(NegotiateError::InvalidTokenFormat)));
+        }
+
+        #[test]
+        fn wrong_prefix_case() {
+            // GSSAPI is case-sensitive; "negotiate" != "Negotiate"
+            let header = "negotiate aGVsbG8gd29ybGQ=";
+            let result = parse_negotiate_header(header);
+            assert!(matches!(result, Err(NegotiateError::InvalidTokenFormat)));
+        }
+
+        #[test]
+        fn empty_token_after_prefix() {
+            let header = "Negotiate ";
+            let result = parse_negotiate_header(header);
+            assert!(matches!(
+                result,
+                Err(NegotiateError::MissingMutualAuthToken)
+            ));
+        }
+
+        #[test]
+        fn invalid_base64() {
+            let header = "Negotiate !!!not-valid-base64!!!";
+            let result = parse_negotiate_header(header);
+            assert!(matches!(result, Err(NegotiateError::InvalidTokenFormat)));
+        }
+
+        #[test]
+        fn negotiate_only_no_space() {
+            let header = "Negotiate";
+            let result = parse_negotiate_header(header);
+            assert!(matches!(result, Err(NegotiateError::InvalidTokenFormat)));
+        }
+
+        #[test]
+        fn binary_token_roundtrip() {
+            // Simulate a realistic SPNEGO token (just random bytes for testing)
+            let original_bytes: Vec<u8> = vec![0x60, 0x82, 0x01, 0x00, 0x06, 0x09, 0x2a];
+            let encoded = BASE64.encode(&original_bytes);
+            let header = format!("Negotiate {}", encoded);
+
+            let result = parse_negotiate_header(&header).unwrap();
+            assert_eq!(result, original_bytes);
+        }
+    }
+
+    mod error_display {
+        use super::*;
+
+        #[test]
+        fn name_error_displays_context() {
+            let err = NegotiateError::NameError("invalid principal".to_string());
+            let display = format!("{}", err);
+            assert!(display.contains("service name"));
+            assert!(display.contains("invalid principal"));
+        }
+
+        #[test]
+        fn credential_error_displays_context() {
+            let err = NegotiateError::CredentialError("no credentials".to_string());
+            let display = format!("{}", err);
+            assert!(display.contains("credentials"));
+            assert!(display.contains("no credentials"));
+        }
+
+        #[test]
+        fn missing_host_is_descriptive() {
+            let err = NegotiateError::MissingHost;
+            let display = format!("{}", err);
+            assert!(display.contains("host"));
+        }
+
+        #[test]
+        fn mutual_auth_failed_includes_reason() {
+            let err = NegotiateError::MutualAuthFailed("token expired".to_string());
+            let display = format!("{}", err);
+            assert!(display.contains("token expired"));
+        }
+    }
+
+    mod error_traits {
+        use super::*;
+
+        #[test]
+        fn errors_are_send() {
+            fn assert_send<T: Send>() {}
+            assert_send::<NegotiateError>();
+        }
+
+        #[test]
+        fn errors_are_sync() {
+            fn assert_sync<T: Sync>() {}
+            assert_sync::<NegotiateError>();
+        }
+
+        #[test]
+        fn errors_implement_std_error() {
+            fn assert_error<T: std::error::Error>() {}
+            assert_error::<NegotiateError>();
+        }
     }
 }

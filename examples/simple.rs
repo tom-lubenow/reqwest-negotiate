@@ -17,11 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client = reqwest::Client::new();
 
-    let response = client
-        .get(&url)
-        .negotiate_auth()?
-        .send()
-        .await?;
+    let response = client.get(&url).negotiate_auth()?.send().await?;
 
     println!("Status: {}", response.status());
     println!("Headers: {:#?}", response.headers());
