@@ -158,3 +158,81 @@ Contributions are welcome! Areas of interest:
 - Windows SSPI support
 - Additional test coverage
 - Real-world testing reports
+
+## Pure Rust backend (existing kinit cache)
+
+An optional async client uses `rskrb5` instead of system GSSAPI/SSPI. Disable
+**default features** to remove the native Kerberos dependency:
+
+```toml
+reqwest-negotiate = { version = "0.1", default-features = false, features = ["pure-rust"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+```rust,no_run
+use reqwest_negotiate::pure_rust::NegotiateClient;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let mut auth = NegotiateClient::from_default_cache()?;
+let response = auth
+    .send(reqwest::Client::new().get("https://service.example.com/protected"))
+    .await?;
+// The server's Kerberos mutual-authentication reply has been verified.
+println!("{}", response.text().await?);
+# Ok(())
+# }
+```
+
+Run `kinit` before starting the application. `KRB5CCNAME` selects the cache;
+otherwise the backend uses `default_ccache_name` from Kerberos configuration.
+Set `KRB5_CONFIG` when configuration is not at the platform's default location.
+For example, in a POSIX shell, using a private directory:
+
+```sh
+cache_dir=$(mktemp -d)
+export KRB5CCNAME="FILE:$cache_dir/ccache"
+kinit
+cargo run --no-default-features --features pure-rust --example pure_rust -- https://service.example.com/protected
+# Once finished with this cache:
+kdestroy
+rmdir "$cache_dir"
+```
+
+`NegotiateClient::from_cache(config, "FILE:/path/to/cache")` accepts explicit
+configuration and cache names. FILE/WRFILE and MIT DIR caches are supported by
+the backend. KCM, KEYRING, API and MSLSA stores are not supported; valid output
+from `klist` alone does not guarantee the cache is compatible. Unsupported
+stores return an error and never silently fall back to native authentication.
+
+This initial backend supports preemptive, Kerberos-only HTTP Negotiate with a
+verified AP-REP. It requires mutual authentication and rejects incomplete
+negotiation, mechanism-list MICs and unsupported mechanisms. General multi-leg
+SPNEGO, NTLM, proxies requiring authentication, and TLS channel binding are not
+implemented. Unsupported server negotiation responses produce errors rather
+than authentication success. Use the default native backend when its platform integration is needed.
+
+Requests are sent once; streaming bodies need no cloning or replay. Redirects
+are disabled to keep authentication scoped to the requested URL. Transport
+settings come from the authentication client's HTTP client, not the client used
+to create the request builder. Customize them with `with_http_builder`; this
+always disables redirects. Normal reqwest TLS verification remains enabled.
+
+The cache is read at construction, and service tickets are reused in memory.
+Recreate the client after replacing the cache with another `kinit`. Ticket
+acquisition may contact a KDC. The protocol backend is pre-1.0; deployment
+compatibility should be tested against your realm. This feature removes native
+Kerberos libraries, not every possible native dependency selected by TLS features.
+
+### Validation
+
+```sh
+cargo test --no-default-features --features pure-rust --all-targets
+# Optional real-realm test (uses the selected kinit cache):
+NEGOTIATE_TEST_URL=https://service.example.com/protected \
+  cargo test --no-default-features --features pure-rust --test pure_rust live_kinit_cache -- --ignored
+```
+
+Automated tests use synthetic cache credentials and a local server to verify
+AP-REQ/AP-REP exchange, reject forged or incomplete responses, and check redirect
+handling. They do not substitute for MIT/Heimdal/Active Directory KDC testing.
