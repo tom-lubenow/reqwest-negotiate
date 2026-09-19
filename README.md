@@ -236,3 +236,24 @@ NEGOTIATE_TEST_URL=https://service.example.com/protected \
 Automated tests use synthetic cache credentials and a local server to verify
 AP-REQ/AP-REP exchange, reject forged or incomplete responses, and check redirect
 handling. They do not substitute for MIT/Heimdal/Active Directory KDC testing.
+
+### NixOS VM integration test
+
+CI also runs a two-machine NixOS test against an MIT Kerberos KDC and a Python
+HTTP acceptor backed by MIT GSSAPI, independent of the Rust protocol backend.
+It runs `kinit`, verifies that the fresh FILE cache contains only a TGT (no HTTP
+service ticket), and authenticates with the compiled pure Rust example. This
+exercises service-ticket acquisition and server mutual authentication. Native
+`curl --negotiate -u :` must authenticate to the same endpoint, and the Rust
+client must fail after `kdestroy`.
+
+```sh
+# x86_64 Linux with KVM, or a configured Linux remote builder with KVM:
+nix build -L .#checks.x86_64-linux.kerberos
+```
+
+Nixpkgs is pinned in `flake.lock`; Cargo dependencies come from `Cargo.lock`.
+All principals, passwords, keys and caches are created inside disposable test
+VMs. No enterprise credentials or CI secrets are needed. This covers MIT
+Kerberos and FILE caches; it does not establish Active Directory, Heimdal or
+KCM compatibility.
