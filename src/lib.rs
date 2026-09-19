@@ -1,12 +1,21 @@
 //! Kerberos/SPNEGO Negotiate authentication for reqwest.
 //!
 //! This crate provides an extension trait for [`reqwest::RequestBuilder`] that adds
-//! Kerberos SPNEGO (Negotiate) authentication support using the system's GSSAPI library.
+//! Kerberos SPNEGO (Negotiate) authentication support.
 //!
 //! # Prerequisites
 //!
 //! - A valid Kerberos ticket (obtained via `kinit` or similar)
-//! - GSSAPI libraries installed on your system (`libgssapi_krb5` on Linux, Heimdal on macOS)
+//! - With the default `native` feature: system GSSAPI/SSPI libraries
+//! - With `default-features = false, features = ["pure-rust"]`: a FILE/WRFILE
+//!   or MIT DIR credential cache, selected by `KRB5CCNAME` or Kerberos config
+//!
+//! Both implementations expose the same synchronous extension methods. Ticket
+//! acquisition can block on KDC I/O. The cache backend owns its runtime internally
+//! and can be called from Tokio. If both features are enabled, the cache backend
+//! is selected. It does not support KCM/KEYRING/API/MSLSA caches, NTLM, channel
+//! binding or additional SPNEGO exchanges. Configure redirects on your reqwest
+//! client; disable them when verifying authentication for a specific service.
 //!
 //! # Basic Example
 //!
@@ -74,7 +83,16 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use cross_krb5::{ClientCtx, InitiateFlags, PendingClientCtx, Step};
+#[cfg(feature = "pure-rust")]
+mod cache;
+#[cfg(feature = "pure-rust")]
+use cache as backend;
+#[cfg(all(feature = "native", not(feature = "pure-rust")))]
+mod system;
+#[cfg(all(feature = "native", not(feature = "pure-rust")))]
+use system as backend;
+#[cfg(not(any(feature = "native", feature = "pure-rust")))]
+compile_error!("enable either the native or pure-rust Cargo feature");
 use reqwest::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use reqwest::{RequestBuilder, Response};
 
@@ -88,6 +106,7 @@ fn spn_from_host(host: &str) -> String {
 /// Parses a Negotiate token from a WWW-Authenticate header value.
 ///
 /// Returns the decoded token bytes, or an error if the header is malformed.
+#[cfg(any(test, not(feature = "pure-rust")))]
 fn parse_negotiate_header(header_value: &str) -> Result<Vec<u8>, NegotiateError> {
     let token_b64 = header_value
         .strip_prefix("Negotiate ")
@@ -138,18 +157,13 @@ pub enum NegotiateError {
     InvalidTokenFormat,
 }
 
-/// Internal state for the context - either pending or complete.
-enum ContextState {
-    Pending(PendingClientCtx),
-    Complete(ClientCtx),
-}
-
-/// Holds the GSSAPI context for mutual authentication verification.
+/// Holds the authentication context for verifying the server response.
 ///
 /// After sending a request with [`NegotiateAuthExt::negotiate_auth_mutual`],
 /// use this context to verify the server's response token.
 pub struct NegotiateContext {
-    state: Option<ContextState>,
+    context: backend::Context,
+    complete: bool,
 }
 
 impl NegotiateContext {
@@ -183,47 +197,22 @@ impl NegotiateContext {
     /// # }
     /// ```
     pub fn verify_response(&mut self, response: &Response) -> Result<(), NegotiateError> {
-        let header = response
-            .headers()
-            .get(WWW_AUTHENTICATE)
-            .ok_or(NegotiateError::MissingMutualAuthToken)?;
-
-        let header_str = header
-            .to_str()
-            .map_err(|_| NegotiateError::InvalidTokenFormat)?;
-
-        let token = parse_negotiate_header(header_str)?;
-
-        // Take ownership of the state to step it
-        let current_state = self.state.take().ok_or(NegotiateError::ContextError(
-            "context already consumed".into(),
-        ))?;
-
-        match current_state {
-            ContextState::Pending(pending) => match pending.step(&token) {
-                Ok(Step::Continue((new_pending, _))) => {
-                    self.state = Some(ContextState::Pending(new_pending));
-                    Ok(())
-                }
-                Ok(Step::Finished((ctx, _))) => {
-                    self.state = Some(ContextState::Complete(ctx));
-                    Ok(())
-                }
-                Err(e) => Err(NegotiateError::MutualAuthFailed(e.to_string())),
-            },
-            ContextState::Complete(ctx) => {
-                // Already complete, restore state
-                self.state = Some(ContextState::Complete(ctx));
-                Ok(())
-            }
+        if self.complete {
+            return Err(NegotiateError::ContextError(
+                "context already verified".into(),
+            ));
         }
+        let header = response_header(response.headers())?;
+        self.context.verify(header)?;
+        self.complete = true;
+        Ok(())
     }
 
     /// Checks if the security context is fully established.
     ///
     /// Returns `true` if mutual authentication is complete.
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, Some(ContextState::Complete(_)))
+        self.complete
     }
 }
 
@@ -327,19 +316,14 @@ impl NegotiateAuthExt for RequestBuilder {
     }
 
     fn negotiate_auth_mutual(self) -> Result<(RequestBuilder, NegotiateContext), NegotiateError> {
-        // Build a temporary copy to inspect the URL
-        let request = self
-            .try_clone()
-            .ok_or_else(|| NegotiateError::ContextError("request body not clonable".into()))?
-            .build()?;
-
+        let (client, request) = self.build_split();
+        let request = request?;
         let host = request
             .url()
             .host_str()
             .ok_or(NegotiateError::MissingHost)?;
         let spn = spn_from_host(host);
-
-        add_negotiate_header_with_ctx(self, &spn)
+        add_negotiate_header_with_ctx(RequestBuilder::from_parts(client, request), &spn)
     }
 
     fn negotiate_auth_mutual_with_spn(
@@ -357,11 +341,13 @@ fn add_negotiate_header_with_ctx(
     let (token, ctx) = generate_negotiate_token_with_ctx(spn)?;
     let header_value = format!("Negotiate {}", BASE64.encode(&token));
 
-    let builder = builder.header(
-        AUTHORIZATION,
-        HeaderValue::from_str(&header_value)
-            .map_err(|e| NegotiateError::ContextError(e.to_string()))?,
-    );
+    let mut header = HeaderValue::from_str(&header_value)
+        .map_err(|e| NegotiateError::ContextError(e.to_string()))?;
+    header.set_sensitive(true);
+    let (client, request) = builder.build_split();
+    let mut request = request?;
+    request.headers_mut().insert(AUTHORIZATION, header);
+    let builder = RequestBuilder::from_parts(client, request);
 
     Ok((builder, ctx))
 }
@@ -369,16 +355,56 @@ fn add_negotiate_header_with_ctx(
 fn generate_negotiate_token_with_ctx(
     spn: &str,
 ) -> Result<(Vec<u8>, NegotiateContext), NegotiateError> {
-    // Initialize the client context - cross-krb5 handles credential acquisition
-    // ClientCtx::new returns (PendingClientCtx, initial_token)
-    let (pending_ctx, token) = ClientCtx::new(InitiateFlags::empty(), None, spn, None)
-        .map_err(|e| NegotiateError::ContextError(e.to_string()))?;
+    let (token, context) = backend::generate(spn)?;
+    Ok((
+        token,
+        NegotiateContext {
+            context,
+            complete: false,
+        },
+    ))
+}
 
-    let ctx = NegotiateContext {
-        state: Some(ContextState::Pending(pending_ctx)),
-    };
-
-    Ok((token.to_vec(), ctx))
+fn response_header(headers: &reqwest::header::HeaderMap) -> Result<&str, NegotiateError> {
+    // Negotiate tokens are base64 and contain no commas. Other schemes can have
+    // quoted commas; scan only outside quotes so their parameters cannot spoof
+    // a Negotiate challenge.
+    for value in headers.get_all(WWW_AUTHENTICATE) {
+        let value = value
+            .to_str()
+            .map_err(|_| NegotiateError::InvalidTokenFormat)?;
+        let mut quoted = false;
+        let mut escaped = false;
+        let mut start = 0;
+        for (index, ch) in value
+            .char_indices()
+            .chain(std::iter::once((value.len(), ',')))
+        {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if quoted && ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                quoted = !quoted;
+            }
+            if ch == ',' && !quoted {
+                let part = value[start..index].trim();
+                let scheme = part.split_whitespace().next().unwrap_or("");
+                if scheme.eq_ignore_ascii_case("Negotiate") {
+                    if part.len() == scheme.len() {
+                        return Err(NegotiateError::MissingMutualAuthToken);
+                    }
+                    return Ok(part);
+                }
+                start = index + 1;
+            }
+        }
+    }
+    Err(NegotiateError::MissingMutualAuthToken)
 }
 
 #[cfg(test)]
@@ -536,5 +562,23 @@ mod tests {
             fn assert_error<T: std::error::Error>() {}
             assert_error::<NegotiateError>();
         }
+    }
+}
+
+#[cfg(test)]
+mod response_headers {
+    use super::*;
+    #[test]
+    fn selects_challenge_across_headers_without_matching_quoted_parameters() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"example, Negotiate bogus\""),
+        );
+        headers.append(
+            WWW_AUTHENTICATE,
+            HeaderValue::from_static("Digest realm=\"test\", nEgOtIaTe YQ=="),
+        );
+        assert_eq!(response_header(&headers).unwrap(), "nEgOtIaTe YQ==");
     }
 }

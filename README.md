@@ -158,3 +158,107 @@ Contributions are welcome! Areas of interest:
 - Windows SSPI support
 - Additional test coverage
 - Real-world testing reports
+
+## Credential-cache backend
+
+To use existing `kinit` tickets without linking system Kerberos libraries, select
+this Cargo configuration:
+
+```toml
+reqwest-negotiate = { version = "0.1", default-features = false, features = ["pure-rust"] }
+```
+
+The feature changes the implementation, not the API. Use the same
+`NegotiateAuthExt`, `NegotiateContext`, and `NegotiateError` types:
+
+```rust,no_run
+use reqwest_negotiate::NegotiateAuthExt;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = reqwest::Client::builder()
+    .redirect(reqwest::redirect::Policy::none())
+    .build()?;
+let (request, mut context) = client
+    .get("https://service.example.com/protected")
+    .negotiate_auth_mutual()?;
+let response = request.send().await?;
+context.verify_response(&response)?;
+println!("{}", response.text().await?);
+# Ok(())
+# }
+```
+
+The shorter `.negotiate_auth()?.send().await?` flow and custom-SPN methods
+also work unchanged. As with the native implementation, use the mutual methods
+and `verify_response` when you need to verify the server's identity.
+
+The caller's reqwest client controls TLS, proxy settings, timeouts, connection
+pooling and redirects. Disable redirects when authenticating a particular
+service. Request bodies are not cloned or replayed. Both backends prepare tokens
+synchronously and may block while contacting a KDC; the cache backend manages its
+own runtime internally and works inside Tokio, including a current-thread runtime.
+HTTP request timeouts do not govern this credential-acquisition step.
+
+`KRB5CCNAME` selects the existing cache, otherwise `default_ccache_name` in
+Kerberos configuration is used. Set `KRB5_CONFIG` for a non-default config file.
+A new cache snapshot is loaded for each authentication attempt, so a later
+`kinit` is picked up without recreating your HTTP client. Example:
+
+```sh
+cache_dir=$(mktemp -d)
+export KRB5CCNAME="FILE:$cache_dir/ccache"
+kinit
+cargo run --no-default-features --features pure-rust --example mutual_auth -- https://service.example.com/protected
+kdestroy
+rmdir "$cache_dir"
+```
+
+The backend supports FILE/WRFILE and MIT DIR caches. KCM, KEYRING, API and MSLSA
+stores are unsupported and produce credential errors. This initial implementation
+supports Kerberos HTTP Negotiate and AP-REP verification; it rejects additional
+SPNEGO exchanges, mechanism-list MICs and unsupported mechanisms during response
+verification. NTLM, proxy authentication and TLS channel binding are unsupported.
+The implementation uses pre-1.0 `rskrb5`; test your realm's policies before deployment.
+Its cache validity checks do not allow clock skew: a newly issued ticket can be
+rejected while the client clock is behind the KDC, even when native Kerberos
+accepts it. Keep clocks synchronized; this backend does not yet match native
+Kerberos's clock-skew tolerance.
+
+The default `native` feature retains system GSSAPI/SSPI integration. If both
+features are enabled, the credential-cache implementation is selected. Disable
+default features to exclude the native dependency. This choice removes native
+Kerberos dependencies; TLS features can independently select native dependencies.
+
+### Validation
+
+```sh
+cargo test --no-default-features --features pure-rust --all-targets
+# Optional deployment test using your current cache:
+NEGOTIATE_TEST_URL=https://service.example.com/protected \
+  cargo test --no-default-features --features pure-rust --test credential_cache live_kinit_cache -- --ignored
+```
+
+Synthetic cache tests exercise the public extension methods in isolated processes,
+including a current-thread Tokio runtime, custom SPNs, forged/missing/incomplete
+server replies, and the caller's redirect policy.
+
+### NixOS VM integration test
+
+CI also runs a two-machine NixOS test against an MIT Kerberos KDC and a Python
+HTTP acceptor backed by MIT GSSAPI, independent of the Rust protocol backend.
+It runs `kinit`, verifies that the fresh FILE cache contains only a TGT (no HTTP
+service ticket), and authenticates with the compiled pure Rust example. This
+exercises service-ticket acquisition and server mutual authentication. Native
+`curl --negotiate -u :` must authenticate to the same endpoint, and the Rust
+client must fail after `kdestroy`.
+
+```sh
+# x86_64 Linux with KVM, or a configured Linux remote builder with KVM:
+nix build -L .#checks.x86_64-linux.kerberos
+```
+
+Nixpkgs is pinned in `flake.lock`; Cargo dependencies come from `Cargo.lock`.
+All principals, passwords, keys and caches are created inside disposable test
+VMs. No enterprise credentials or CI secrets are needed. This covers MIT
+Kerberos and FILE caches; it does not establish Active Directory, Heimdal or
+KCM compatibility.
