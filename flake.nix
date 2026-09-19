@@ -11,13 +11,13 @@
       cargoLock.lockFile = ./Cargo.lock;
       buildNoDefaultFeatures = true;
       buildFeatures = [ "pure-rust" ];
-      cargoBuildFlags = [ "--example" "pure_rust" ];
+      cargoBuildFlags = [ "--example" "mutual_auth" ];
       nativeBuildInputs = [ pkgs.pkg-config pkgs.cmake ];
       buildInputs = [ pkgs.openssl ];
       doCheck = false; # The VM check below runs the built client against MIT Kerberos.
       installPhase = ''
         mkdir -p $out/bin
-        cp target/x86_64-unknown-linux-gnu/release/examples/pure_rust $out/bin/negotiate
+        cp target/x86_64-unknown-linux-gnu/release/examples/mutual_auth $out/bin/negotiate
       '';
     };
   in {

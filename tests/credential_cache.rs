@@ -2,7 +2,7 @@
 
 // Synthetic tickets and keys only. Exercises cache loading, HTTP transport and
 // real AP-REQ/AP-REP cryptography without a KDC or the developer's credentials.
-use reqwest_negotiate::pure_rust::{Config, Error, NegotiateClient};
+use reqwest_negotiate::{NegotiateAuthExt, NegotiateError};
 use rskrb5::{
     ccache,
     client::{AsRepSession, Principal},
@@ -69,18 +69,10 @@ fn cache() -> tempfile::NamedTempFile {
     file
 }
 
-async fn exchange(mode: &'static str) -> Result<reqwest::Response, Error> {
+fn exchange(mode: &'static str) {
     let cache = cache();
-    let config = Config::parse("[libdefaults]\n default_realm = EXAMPLE.TEST\n").unwrap();
-    let mut client =
-        NegotiateClient::from_cache(config, &format!("FILE:{}", cache.path().display()))
-            .unwrap()
-            .with_http_builder(
-                reqwest::Client::builder()
-                    .no_proxy()
-                    .timeout(Duration::from_secs(5)),
-            )
-            .unwrap();
+    let mut config = tempfile::NamedTempFile::new().unwrap();
+    write!(config, "[libdefaults]\n default_realm = EXAMPLE.TEST\n").unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -158,45 +150,100 @@ async fn exchange(mode: &'static str) -> Result<reqwest::Response, Error> {
         };
         write!(stream, "HTTP/1.1 {status}\r\n{auth_header}Location: http://{address}/redirected\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").unwrap();
     });
-    let result = client
-        .send(reqwest::Client::new().get(format!("http://{address}/")))
-        .await;
+    // Environment configuration is isolated in a subprocess, never mutated in
+    // the parallel test process. This calls the actual public extension API.
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "request_worker", "--nocapture"])
+        .env("KRB5_CONFIG", config.path())
+        .env("KRB5CCNAME", format!("FILE:{}", cache.path().display()))
+        .env("TEST_URL", format!("http://{address}/"))
+        .env("TEST_MODE", mode)
+        .output()
+        .unwrap();
     server.join().unwrap();
-    result
-}
-
-#[tokio::test]
-async fn cached_service_ticket_authenticates_and_verifies_server() {
-    assert_eq!(exchange("valid").await.unwrap().text().await.unwrap(), "ok");
-}
-
-#[tokio::test]
-async fn forged_missing_and_incomplete_responses_fail() {
-    assert!(matches!(exchange("forged").await, Err(Error::Spnego(_))));
-    assert!(matches!(
-        exchange("missing").await,
-        Err(Error::MissingMutualAuth)
-    ));
-    assert!(matches!(
-        exchange("continue").await,
-        Err(Error::UnsupportedNegotiation)
-    ));
-}
-
-#[tokio::test]
-async fn redirects_are_not_followed() {
-    assert_eq!(
-        exchange("redirect").await.unwrap().status(),
-        reqwest::StatusCode::FOUND
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
     );
 }
 
-/// Run against an actual kinit cache and Negotiate endpoint supplied by the user.
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "subprocess helper with isolated credential environment"]
+async fn request_worker() {
+    let url = std::env::var("TEST_URL").unwrap();
+    let mode = std::env::var("TEST_MODE").unwrap();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let (request, mut context) = if mode == "custom" {
+        client
+            .get(url)
+            .negotiate_auth_mutual_with_spn("HTTP/127.0.0.1@EXAMPLE.TEST")
+            .unwrap()
+    } else {
+        client.get(url).negotiate_auth_mutual().unwrap()
+    };
+    assert!(!context.is_complete());
+    let response = request.send().await.unwrap();
+    let verified = context.verify_response(&response);
+    match mode.as_str() {
+        "forged" | "continue" => {
+            assert!(matches!(verified, Err(NegotiateError::MutualAuthFailed(_))))
+        }
+        "missing" => assert!(matches!(
+            verified,
+            Err(NegotiateError::MissingMutualAuthToken)
+        )),
+        _ => {
+            verified.unwrap();
+            assert!(context.is_complete());
+            assert!(context.verify_response(&response).is_err());
+            assert_eq!(
+                response.status().as_u16(),
+                if mode == "redirect" { 302 } else { 200 }
+            );
+            assert_eq!(response.text().await.unwrap(), "ok");
+        }
+    }
+}
+
+#[test]
+fn cached_service_ticket_authenticates_and_verifies_server() {
+    exchange("valid");
+}
+
+#[test]
+fn custom_service_principal() {
+    exchange("custom");
+}
+
+#[test]
+fn forged_missing_and_incomplete_responses_fail() {
+    for mode in ["forged", "missing", "continue"] {
+        exchange(mode);
+    }
+}
+
+#[test]
+fn caller_redirect_policy_is_preserved() {
+    exchange("redirect");
+}
+
 #[tokio::test]
 #[ignore = "requires KRB5CCNAME, Kerberos configuration and NEGOTIATE_TEST_URL"]
 async fn live_kinit_cache() {
     let url = std::env::var("NEGOTIATE_TEST_URL").expect("NEGOTIATE_TEST_URL");
-    let mut client = NegotiateClient::from_default_cache().unwrap();
-    let response = client.send(reqwest::Client::new().get(url)).await.unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let (request, mut context) = client.get(url).negotiate_auth_mutual().unwrap();
+    let response = request.send().await.unwrap();
+    context.verify_response(&response).unwrap();
     assert!(response.status().is_success());
 }
