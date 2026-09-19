@@ -80,6 +80,12 @@ in pkgs.testers.runNixOSTest {
         tickets = client.succeed("klist")
         assert "krbtgt/${realm}@${realm}" in tickets, tickets
         assert "HTTP/server" not in tickets, tickets
+        # The VMs' RTCs can differ by a second after boot. rskrb5 0.2 checks
+        # ticket start times without a clock-skew allowance. Wait until this
+        # TGT is valid on the client; do not retry the authentication itself.
+        issued_by = int(server.succeed("date +%s").strip())
+        print(f"KDC time after kinit: {issued_by}; client time: {client.succeed('date +%s').strip()}")
+        client.wait_until_succeeds(f"test $(date +%s) -ge {issued_by}", timeout=10)
         result = client.succeed("negotiate http://server:8080/")
         assert "200 OK" in result, result
         assert "authenticated: alice@${realm}" in result, result

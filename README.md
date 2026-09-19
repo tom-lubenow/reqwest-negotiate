@@ -219,6 +219,10 @@ supports Kerberos HTTP Negotiate and AP-REP verification; it rejects additional
 SPNEGO exchanges, mechanism-list MICs and unsupported mechanisms during response
 verification. NTLM, proxy authentication and TLS channel binding are unsupported.
 The implementation uses pre-1.0 `rskrb5`; test your realm's policies before deployment.
+Its cache validity checks do not allow clock skew: a newly issued ticket can be
+rejected while the client clock is behind the KDC, even when native Kerberos
+accepts it. Keep clocks synchronized; this backend does not yet match native
+Kerberos's clock-skew tolerance.
 
 The default `native` feature retains system GSSAPI/SSPI integration. If both
 features are enabled, the credential-cache implementation is selected. Disable
